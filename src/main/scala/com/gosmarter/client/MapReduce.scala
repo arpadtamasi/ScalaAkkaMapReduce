@@ -1,15 +1,116 @@
 package com.gosmarter.client
 
-import akka.actor.Actor
+import scala.collection.mutable.HashMap
+import scala.collection.mutable.Map
+import scala.collection.mutable.SynchronizedMap
 import scala.io.Source
-import java.io.File
+
+import org.slf4j.LoggerFactory
+
+import akka.actor.Actor
 import akka.actor.ActorRef
-import scala.collection.mutable.{
-  Map,
-  HashMap
+import akka.actor.actorRef2Scala
+
+trait Logging {
+  lazy val logger = LoggerFactory.getLogger(getClass)
+
+  def debug(message: => String) = if (logger.isDebugEnabled) logger.debug(message)
+}
+/**
+ * MapActor generate list of Results
+ */
+case class Result(word: String, count: Int) {
+  override def toString = s"($count of $word)"
 }
 
-class MapActor(reducerActor: ActorRef) extends Actor {
+// Messages
+case class DisplayList()
+case class Displayed()
+
+case class Line(text: String)
+case class EOF()
+
+case class File(filename: String)
+case class Lines(lines: List[String])
+
+case class AggregatedResults(results: Map[String, Int])
+case class Results(results: List[Result])
+
+/**
+ * ControllerActor gets messages and forwards them to Aggregate or Map actor
+ */
+class ControllerActor(aggregateActor: ActorRef, mapRouter: ActorRef) extends Actor with Logging {
+  def receive = {
+    case DisplayList() => {
+      debug("Display list")
+      aggregateActor.tell(DisplayList(), sender)
+      sender ! Displayed()
+    }
+    case Line(text) => mapRouter ! Line(text)
+  }
+}
+
+/**
+ * Reads a file and sends each line to ControllerActor
+ */
+class FileReadActor extends Actor with Logging {
+  def receive = {
+    case File(filename) => {
+      debug(s"Read $filename")
+      val lines = Source.fromURL(getClass.getResource(filename)).getLines
+
+      lines foreach (sender ! Line(_))
+      sender ! EOF()
+    }
+  }
+}
+
+/**
+ * Sends each line of a list to ControllerActor
+ */
+class LineReadActor extends Actor with Logging {
+  def receive = {
+    case Lines(lines) => {
+      lines foreach (sender ! Line(_))
+      sender ! EOF()
+    }
+  }
+}
+
+/**
+ * Aggregates results received from ReduceActors
+ */
+class AggregateActor extends Actor with Logging {
+  var finalReducedMap: Map[String, Int] = new HashMap[String, Int] with SynchronizedMap[String, Int]
+
+  def receive = {
+    case DisplayList() => {
+      debug(finalReducedMap.mkString("|"))
+      sender ! AggregatedResults(finalReducedMap)
+    }
+    case AggregatedResults(results) => {
+      debug(results.mkString("|"))
+      results.foreach { case (word, count) => finalReducedMap update (word, count + finalReducedMap.getOrElseUpdate(word, 0)) }
+    }
+  }
+}
+
+/**
+ * Reduces (word -> 1) lists to (word -> count) map
+ */
+class ReduceActor(aggregateActor: ActorRef) extends Actor with Logging {
+  def receive = {
+    case Results(results) => {
+      debug(results.mkString("|"))
+      aggregateActor ! AggregatedResults((Map.empty[String, Int] /: results) { case (m, r) => m + (r.word -> (m.getOrElseUpdate(r.word, 0) + r.count)) })
+    }
+  }
+}
+
+/**
+ * Maps strings to (word -> 1) lists
+ */
+class MapActor(reducerActor: ActorRef) extends Actor with Logging {
 
   val STOP_WORDS: List[String] = List("a", "about", "above", "above", "across", "after",
     "afterwards", "again", "against", "all", "almost", "alone",
@@ -58,17 +159,12 @@ class MapActor(reducerActor: ActorRef) extends Actor {
     "within", "without", "would", "yet", "you", "your", "yours",
     "yourself", "yourselves", "the")
 
-  def evaluateExpression(line: String): List[Result] = {
-    var result = for (word <- line split (" ") toList; if !STOP_WORDS.contains(word.toLowerCase)) 
-      yield (new Result(word, 1))
-
-    return result
-  }
+  def isStopword(word: String) = STOP_WORDS.contains(word.toLowerCase)
 
   def receive = {
-    case x: String => {
-      println("ReduceActor****" + x)
-      reducerActor ! evaluateExpression(x)
+    case Line(text) => {
+      debug(text)
+      reducerActor ! Results(text.split(" ").toList filter (!isStopword(_)) map (new Result(_, 1)))
     }
   }
 }
